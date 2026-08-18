@@ -288,12 +288,14 @@ const ITEMS_PER_PAGE = 20;
 let purchasesCurrentPage = 1;
 let comprasTotalPages = 1;
 let activeLocalEventId = localStorage.getItem('elcolao.activeLocalEventId') || null;
+let activeEventId = Number(localStorage.getItem('elcolao.activeEventId')) || null;
+let activeEvent = null;
 let snapshotTimer = null;
+let suppressSnapshot = false;
 
 // ========== SUPABASE CONFIGURACIÓN ==========
 const SUPABASE_URL = 'https://iizljgpzutiisheesafy.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlpemxqZ3B6dXRpaXNoZWVzYWZ5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzMjI1MDgsImV4cCI6MjA5Nzg5ODUwOH0.ltkHxDuW5OrCQr_KeNV6XkyYDvSRJKoul8b11BceIb8';
-const SUPABASE_EVENT_ID = 1; // ID del evento en Supabase (cambiar si es diferente)
 let supabase = null; // Se inicializa después
 let realtimeSubscription = null; // Para desuscribirse
 let currentDeviceId = null; // ID único de este dispositivo
@@ -405,7 +407,7 @@ function putRecord(storeName, record){
   return new Promise((resolve, reject)=>{
     const t = tx(storeName, 'readwrite');
     const req = t.objectStore(storeName).put(record);
-    req.onsuccess = ()=> { scheduleEventSnapshot(); resolve(req.result); };
+    req.onsuccess = ()=> { if(!suppressSnapshot) scheduleEventSnapshot(); resolve(req.result); };
     req.onerror = ()=> reject(req.error);
   });
 }
@@ -414,14 +416,33 @@ function deleteRecord(storeName, id){
   return new Promise((resolve, reject)=>{
     const t = tx(storeName, 'readwrite');
     const req = t.objectStore(storeName).delete(id);
-    req.onsuccess = ()=> { scheduleEventSnapshot(); resolve(true); };
+    req.onsuccess = ()=> { if(!suppressSnapshot) scheduleEventSnapshot(); resolve(true); };
     req.onerror = ()=> reject(req.error);
   });
 }
 
 async function loadEventConfig(){
   const cfg = await getById('eventConfig', 1);
-  eventCfg = cfg || { id:1, eventName:'Mi Evento', currencySymbol:'$', setupCompleted:false };
+  eventCfg = cfg || { id:1, eventId:activeEventId, eventName:'Mi Evento', currencySymbol:'$', setupCompleted:false };
+  activeEventId = Number(eventCfg.eventId || activeEventId) || null;
+  if(activeEventId) localStorage.setItem('elcolao.activeEventId', String(activeEventId));
+}
+
+function setActiveEventId(eventId){
+  activeEventId = eventId ? Number(eventId) : null;
+  if(activeEventId) localStorage.setItem('elcolao.activeEventId', String(activeEventId));
+  else localStorage.removeItem('elcolao.activeEventId');
+}
+
+function requireActiveEvent(){
+  if(!activeEventId) throw new Error('No hay ningún evento activo.');
+  return activeEventId;
+}
+
+function localEventKeyForRemote(eventId){ return `remote_${eventId}`; }
+
+function currentQueueEventId(record=null){
+  return Number(record?.eventId || eventCfg?.eventId || activeEventId) || null;
 }
 // ========== FIN: BASE DE DATOS ==========
 
@@ -545,14 +566,14 @@ const EventRegistry = {
 async function collectLocalEventPayload(kind='autosave'){
   const data = {};
   for(const store of BackupService.stores){ data[store] = await getAll(store); }
-  return { app:'ElColao', kind, version:BackupService.version, dbName:DB_NAME, dbVersion:DB_VERSION, exportedAt:new Date().toISOString(), eventName:eventCfg?.eventName||'', data };
+  return { app:'ElColao', kind, version:BackupService.version, dbName:DB_NAME, dbVersion:DB_VERSION, exportedAt:new Date().toISOString(), localEventId:activeLocalEventId, remoteEventId:eventCfg?.eventId||activeEventId||null, eventName:eventCfg?.eventName||'', eventConfig:eventCfg||null, ticketTypes:data.ticketTypes, purchases:data.purchases, data };
 }
 
 async function saveActiveEventSnapshot(){
   if(!activeLocalEventId || !eventCfg?.setupCompleted) return;
   const payload = await collectLocalEventPayload('event-snapshot');
   localStorage.setItem(`elcolao.snapshot.${activeLocalEventId}`, JSON.stringify(payload));
-  EventRegistry.upsert({ id:activeLocalEventId, name:eventCfg.eventName, currencySymbol:eventCfg.currencySymbol, purchases:payload.data.purchases.length, tickets:payload.data.ticketTypes.length });
+  EventRegistry.upsert({ id:activeLocalEventId, remoteEventId:eventCfg.eventId||activeEventId||null, remoteSyncPending:!!eventCfg.remoteSyncPending, name:eventCfg.eventName, currencySymbol:eventCfg.currencySymbol, purchases:payload.data.purchases.length, tickets:payload.data.ticketTypes.length });
 }
 
 function scheduleEventSnapshot(){
@@ -561,11 +582,16 @@ function scheduleEventSnapshot(){
 }
 
 async function clearWorkingDatabase(){
-  for(const storeName of BackupService.stores){
-    const records = await getAll(storeName);
-    for(const record of records) await deleteRecord(storeName, record.id);
+  suppressSnapshot = true;
+  try{
+    for(const storeName of BackupService.stores){
+      const records = await getAll(storeName);
+      for(const record of records) await deleteRecord(storeName, record.id);
+    }
+    eventCfg = null;
+  } finally {
+    suppressSnapshot = false;
   }
-  eventCfg = null;
 }
 
 async function openHome(){
@@ -574,48 +600,218 @@ async function openHome(){
   document.getElementById('app').classList.add('hidden');
   document.getElementById('wizardOverlay').classList.add('hidden');
   document.getElementById('homeOverlay').classList.remove('hidden');
-  renderHomeEvents();
+  await renderHomeEvents();
 }
 
-function renderHomeEvents(){
+async function renderHomeEvents(){
   const wrap = document.getElementById('homeEventsList');
-  const events = EventRegistry.list();
-  if(!events.length){
+  const localEvents = EventRegistry.list();
+  let remoteEvents = [];
+  if(supabase && navigator.onLine){
+    remoteEvents = await loadRemoteEvents();
+  }
+  const localByRemote = new Map(localEvents.filter(e=>e.remoteEventId).map(e=>[String(e.remoteEventId), e]));
+  const rows = [
+    ...remoteEvents.map(r=>({ id:localByRemote.get(String(r.id))?.id || localEventKeyForRemote(r.id), remoteEventId:r.id, name:r.name, currencySymbol:r.currencySymbol||'$', updatedAt:new Date(r.createdAt||Date.now()).getTime(), remote:true })),
+    ...localEvents.filter(e=> !e.remoteEventId || !remoteEvents.some(r=>String(r.id)===String(e.remoteEventId))).map(e=>({ ...e, local:true }))
+  ];
+  if(!rows.length){
     wrap.innerHTML = '<div class="text-sm text-[var(--text-dim)] py-8 text-center">Todavía no hay eventos guardados en este dispositivo.</div>';
     return;
   }
-  wrap.innerHTML = events.map(e=>`
+  wrap.innerHTML = rows.map(e=>`
     <div class="flex items-center justify-between gap-3 px-4 py-3 rounded-lg" style="background:var(--surface-2); border:1px solid var(--line);">
-      <div class="min-w-0"><div class="font-semibold truncate">${escHtml(e.name)}</div><div class="text-xs text-[var(--text-dim)]">${e.purchases||0} compras · ${e.tickets||0} tipos · ${formatDateTime(e.updatedAt)}</div></div>
-      <div class="flex gap-2"><button class="btn btn-accent text-xs" data-open-event="${e.id}">Abrir</button><button class="btn btn-ghost text-xs" data-delete-event="${e.id}">🗑️</button></div>
+      <div class="min-w-0"><div class="font-semibold truncate">${escHtml(e.name)} ${e.remoteSyncPending ? '<span class="badge" style="background:var(--accent); color:#1A1306;">pendiente</span>' : ''}</div><div class="text-xs text-[var(--text-dim)]">${e.remote ? 'Supabase' : 'Local'} · ${e.purchases||0} compras · ${e.tickets||0} tipos · ${formatDateTime(e.updatedAt)}</div></div>
+      <div class="flex gap-2"><button class="btn btn-accent text-xs" data-open-event="${e.id}" data-remote-event="${e.remoteEventId||''}">Abrir</button><button class="btn btn-ghost text-xs" data-delete-event="${e.id}">🗑️</button></div>
     </div>`).join('');
-  wrap.querySelectorAll('[data-open-event]').forEach(btn=> btn.addEventListener('click', ()=> loadEventSnapshot(btn.dataset.openEvent)));
+  wrap.querySelectorAll('[data-open-event]').forEach(btn=> btn.addEventListener('click', ()=> switchEvent(btn.dataset.remoteEvent || btn.dataset.openEvent, btn.dataset.openEvent)));
   wrap.querySelectorAll('[data-delete-event]').forEach(btn=> btn.addEventListener('click', async ()=>{
-    if(await appConfirm('¿Eliminar este evento guardado de este dispositivo?', 'error', 'Eliminar evento', 'Eliminar', 'Cancelar', 'danger')){ EventRegistry.remove(btn.dataset.deleteEvent); renderHomeEvents(); }
+    if(await appConfirm('¿Eliminar este evento guardado de este dispositivo?', 'error', 'Eliminar evento', 'Eliminar', 'Cancelar', 'danger')){ EventRegistry.remove(btn.dataset.deleteEvent); await renderHomeEvents(); }
   }));
 }
 
 async function loadEventSnapshot(id){
   const raw = localStorage.getItem(`elcolao.snapshot.${id}`);
-  if(!raw){ await appAlert('No se encontró la base local de ese evento.', 'error'); return; }
-  await BackupService.restore(JSON.parse(raw));
+  if(!raw){ await appAlert('No se encontró la base local de ese evento.', 'error'); return false; }
+  const payload = JSON.parse(raw);
+  await clearWorkingDatabase();
+  await BackupService.restore(payload);
   activeLocalEventId = id;
   localStorage.setItem('elcolao.activeLocalEventId', id);
-  document.getElementById('homeOverlay').classList.add('hidden');
-  document.getElementById('app').classList.remove('hidden');
-  renderSidebar();
-  navigateTo('compras');
+  await loadEventConfig();
+  setActiveEventId(payload.remoteEventId || eventCfg?.eventId || null);
+  return true;
 }
 
 async function startNewEvent(){
   await saveActiveEventSnapshot();
   await clearWorkingDatabase();
+  setActiveEventId(null);
+  activeEvent = null;
   activeLocalEventId = `local_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
   localStorage.setItem('elcolao.activeLocalEventId', activeLocalEventId);
   document.getElementById('homeOverlay').classList.add('hidden');
   document.getElementById('wizardOverlay').classList.remove('hidden');
   initWizard();
 }
+
+
+async function loadRemoteEvents(){
+  if(!supabase || !navigator.onLine) return [];
+  try{
+    const { data, error } = await supabase
+      .from('events')
+      .select('*')
+      .order('createdAt', { ascending:false });
+    if(error) throw error;
+    return data || [];
+  }catch(err){
+    console.warn('⚠️ No se pudieron cargar eventos remotos:', err);
+    return [];
+  }
+}
+
+async function createRemoteEventForConfig(cfg){
+  if(!supabase || !navigator.onLine) return null;
+  try{
+    const { data, error } = await supabase
+      .from('events')
+      .insert({ name:cfg.eventName, currencySymbol:cfg.currencySymbol || '$', createdAt:new Date().toISOString(), createdBy:currentDeviceId })
+      .select()
+      .single();
+    if(error) throw error;
+    setActiveEventId(data.id);
+    activeEvent = data;
+    cfg.eventId = data.id;
+    cfg.remoteSyncPending = false;
+    await putRecord('eventConfig', cfg);
+    await saveActiveEventSnapshot();
+    return data.id;
+  }catch(err){
+    console.error('❌ No se pudo crear el evento remoto:', err);
+    cfg.remoteSyncPending = true;
+    await putRecord('eventConfig', cfg);
+    return null;
+  }
+}
+
+
+
+async function resolvePendingEventSnapshots(){
+  if(!supabase || !navigator.onLine) return;
+  const events = EventRegistry.list().filter(e=> e.remoteSyncPending || !e.remoteEventId);
+  for(const localMeta of events){
+    try{
+      const raw = localStorage.getItem(`elcolao.snapshot.${localMeta.id}`);
+      if(!raw) continue;
+      const payload = JSON.parse(raw);
+      const cfg = payload.eventConfig || payload.data?.eventConfig?.[0];
+      if(!cfg?.setupCompleted || cfg.eventId || payload.remoteEventId) continue;
+      const { data, error } = await supabase
+        .from('events')
+        .insert({ name:cfg.eventName, currencySymbol:cfg.currencySymbol || '$', createdAt:new Date(cfg.createdAt||Date.now()).toISOString(), createdBy:currentDeviceId })
+        .select()
+        .single();
+      if(error) throw error;
+      cfg.eventId = data.id;
+      cfg.remoteSyncPending = false;
+      payload.remoteEventId = data.id;
+      payload.eventConfig = cfg;
+      payload.data.eventConfig = [cfg];
+      for(const storeName of ['ticketTypes','purchases']){
+        payload.data[storeName] = (payload.data[storeName]||[]).map(r=>({ ...r, eventId:data.id }));
+      }
+      payload.ticketTypes = payload.data.ticketTypes;
+      payload.purchases = payload.data.purchases;
+      localStorage.setItem(`elcolao.snapshot.${localMeta.id}`, JSON.stringify(payload));
+      EventRegistry.upsert({ ...localMeta, remoteEventId:data.id, remoteSyncPending:false });
+      const queued = await getAll('syncQueue');
+      for(const item of queued){
+        if(item.localEventId === localMeta.id && !item.eventId){
+          item.eventId = data.id;
+          item.record = { ...item.record, eventId:data.id };
+          await putRecord('syncQueue', item);
+        }
+      }
+    }catch(err){
+      console.error('❌ No se pudo sincronizar evento local pendiente:', localMeta, err);
+    }
+  }
+}
+
+async function resolvePendingLocalEvent(){
+  const cfg = await getById('eventConfig', 1);
+  if(!cfg?.setupCompleted) return null;
+  if(cfg.eventId){ setActiveEventId(cfg.eventId); return cfg.eventId; }
+  if((cfg.remoteSyncPending || !cfg.eventId) && supabase && navigator.onLine){
+    const newEventId = await createRemoteEventForConfig(cfg);
+    if(newEventId){
+      for(const storeName of ['ticketTypes','purchases']){
+        const records = await getAll(storeName);
+        for(const record of records){
+          if(!record.eventId){ record.eventId = newEventId; await putRecord(storeName, record); }
+        }
+      }
+      const queued = await getAll('syncQueue');
+      for(const item of queued){
+        if(!item.eventId && item.localEventId === activeLocalEventId){ item.eventId = newEventId; item.record = { ...item.record, eventId:newEventId }; await putRecord('syncQueue', item); }
+      }
+    }
+    return newEventId;
+  }
+  return null;
+}
+
+async function openEvent(remoteEventId, localId=null){
+  if(!remoteEventId){
+    const ok = await loadEventSnapshot(localId);
+    if(!ok) return;
+  } else if(supabase && navigator.onLine){
+    const eventId = Number(remoteEventId);
+    setActiveEventId(eventId);
+    const { data:eventRow, error:eventErr } = await supabase.from('events').select('*').eq('id', eventId).maybeSingle();
+    if(eventErr) throw eventErr;
+    if(!eventRow) throw new Error('Evento remoto no encontrado.');
+    const { data:remoteTickets, error:ticketsErr } = await supabase.from('ticketTypes').select('*').eq('eventId', eventId);
+    if(ticketsErr) throw ticketsErr;
+    const { data:remotePurchases, error:purchasesErr } = await supabase.from('purchases').select('*').eq('eventId', eventId);
+    if(purchasesErr) throw purchasesErr;
+    await clearWorkingDatabase();
+    activeLocalEventId = localId || localEventKeyForRemote(eventId);
+    localStorage.setItem('elcolao.activeLocalEventId', activeLocalEventId);
+    eventCfg = { id:1, eventId, eventName:eventRow.name, currencySymbol:eventRow.currencySymbol || '$', setupCompleted:true, createdAt:new Date(eventRow.createdAt||Date.now()).getTime(), remoteSyncPending:false };
+    await putRecord('eventConfig', eventCfg);
+    for(const rt of (remoteTickets||[])){
+      await putRecord('ticketTypes', { id:rt.id, eventId, name:rt.name, category:rt.name, price:rt.price, isActive:rt.isActive, createdAt:rt.createdAt, updatedAt:rt.updatedAt });
+    }
+    for(const rp of (remotePurchases||[])){ await putRecord('purchases', { ...rp, eventId }); }
+    activeEvent = eventRow;
+    await saveActiveEventSnapshot();
+  } else {
+    const fallbackId = localId || localEventKeyForRemote(remoteEventId);
+    const ok = await loadEventSnapshot(fallbackId);
+    if(!ok) return;
+  }
+  document.getElementById('homeOverlay').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  renderSidebar();
+  navigateTo('compras');
+  cleanupRealtimeListener();
+  setupRealtimeListener();
+}
+
+async function switchEvent(eventIdOrLocalId, localId=null){
+  await saveActiveEventSnapshot();
+  if(supabase && navigator.onLine) await processSyncQueue(currentQueueEventId());
+  cleanupRealtimeListener();
+  const maybeRemoteId = Number(eventIdOrLocalId);
+  if(Number.isFinite(maybeRemoteId) && maybeRemoteId > 0){
+    await openEvent(maybeRemoteId, localId);
+  } else {
+    await openEvent(null, localId || eventIdOrLocalId);
+  }
+}
+
 // ========== FIN: SELECTOR OFFLINE DE EVENTOS ==========
 
 // ========== INICIO: SINCRONIZACIÓN SUPABASE ==========
@@ -658,14 +854,10 @@ async function initSupabase(){
     
     // Sincronizar cola al iniciar (si hay conexión)
     if(navigator.onLine){
+      await resolvePendingEventSnapshots();
+      await resolvePendingLocalEvent();
       await processSyncQueue();
-      
-      // ========== DESCARGAR TODO LO QUE YA EXISTE EN SUPABASE ==========
-      // Sin esto, un dispositivo que se conecta por primera vez (o después
-      // de estar offline) nunca vería el evento, los tickets ni las compras
-      // ya registradas por otros dispositivos.
-      await pullRemoteData();
-      // ========== FIN DESCARGA INICIAL ==========
+      if(activeEventId) await pullRemoteData();
     }
   }catch(err){
     console.error('❌ Error inicializando Supabase:', err);
@@ -678,15 +870,16 @@ async function initSupabase(){
 // con la base de datos local. Se ejecuta al conectar y al reconectar,
 // para que el dispositivo "se ponga al día". Después, Realtime mantiene
 // todo sincronizado en vivo sin necesidad de repetir esto.
-async function pullRemoteData(){
+async function pullRemoteData(eventId = activeEventId){
   if(!supabase) return;
+  if(!eventId){ console.warn('⚠️ No hay evento activo para descargar datos remotos.'); return; }
   
   try{
     // 1. Configuración del evento
     const { data: eventRow, error: eventErr } = await supabase
       .from('events')
       .select('*')
-      .eq('id', SUPABASE_EVENT_ID)
+      .eq('id', eventId)
       .maybeSingle();
     
     if(!eventErr && eventRow){
@@ -697,6 +890,7 @@ async function pullRemoteData(){
         // que repetir el wizard en cada dispositivo nuevo.
         eventCfg = {
           id: 1,
+          eventId: eventRow.id,
           eventName: eventRow.name,
           currencySymbol: eventRow.currencySymbol || '$',
           setupCompleted: true,
@@ -711,12 +905,13 @@ async function pullRemoteData(){
     const { data: remoteTickets, error: ticketsErr } = await supabase
       .from('ticketTypes')
       .select('*')
-      .eq('eventId', SUPABASE_EVENT_ID);
+      .eq('eventId', eventId);
     
     if(!ticketsErr && remoteTickets && remoteTickets.length){
       for(const rt of remoteTickets){
         await putRecord('ticketTypes', {
           id: rt.id,
+          eventId,
           name: rt.name,
           category: rt.name,
           price: rt.price,
@@ -728,7 +923,7 @@ async function pullRemoteData(){
     }
     
     // 3. Compras
-    await pullRemotePurchases();
+    await pullRemotePurchases(eventId);
     
   }catch(err){
     console.warn('⚠️ No se pudo descargar datos remotos:', err);
@@ -737,8 +932,9 @@ async function pullRemoteData(){
 
 // Descargar todas las compras existentes del evento desde Supabase
 // y fusionarlas con la base de datos local (IndexedDB).
-async function pullRemotePurchases(){
+async function pullRemotePurchases(eventId = activeEventId){
   if(!supabase) return;
+  if(!eventId){ console.warn('⚠️ No hay evento activo para descargar compras.'); return; }
   
   try{
     console.log('⬇️ Descargando compras existentes del evento...');
@@ -746,7 +942,7 @@ async function pullRemotePurchases(){
     const { data, error } = await supabase
       .from('purchases')
       .select('*')
-      .eq('eventId', SUPABASE_EVENT_ID);
+      .eq('eventId', eventId);
     
     if(error) throw error;
     
@@ -792,7 +988,7 @@ async function pushAllLocalDataToSupabase(){
   for(const p of localPurchases){
     // Asegurar que tenga eventId y deviceId antes de subir
     // (compras creadas en versiones viejas, antes de Supabase, no los tenían)
-    p.eventId = p.eventId || SUPABASE_EVENT_ID;
+    p.eventId = currentQueueEventId(p) || activeEventId;
     p.deviceId = p.deviceId || currentDeviceId;
     p.updatedAt = p.updatedAt || Date.now();
     await putRecord('purchases', p); // guardar localmente los campos completados
@@ -827,13 +1023,10 @@ async function onOnline(){
   showToast('Conexión establecida', 'success', '🔌 Online');
   console.log('🟢 Online');
   
-  // Intentar sincronizar cola
+  await resolvePendingEventSnapshots();
+  await resolvePendingLocalEvent();
   await processSyncQueue();
-  
-  // Descargar cambios que ocurrieron mientras estábamos offline
-  // (Realtime solo avisa de cambios NUEVOS desde que nos suscribimos;
-  // lo que pasó durante la desconexión hay que pedirlo explícitamente)
-  await pullRemoteData();
+  if(activeEventId) await pullRemoteData(activeEventId);
   
   // Recargar datos de Supabase
   if(currentSection === 'compras'){
@@ -862,14 +1055,17 @@ const REMOTE_TABLE_MAP = {
 // Transforma un registro local al formato exacto que espera la tabla remota.
 // Necesario porque 'eventConfig' y 'ticketTypes' tienen nombres de campo
 // distintos localmente que en Supabase (ej: eventName → name).
-function buildRemotePayload(store, record){
+function buildRemotePayload(store, record, eventId = currentQueueEventId(record)){
+  if(store !== 'eventConfig' && !eventId){
+    throw new Error(`No hay eventId para sincronizar ${store}:${record.id}`);
+  }
   if(store === 'purchases'){
-    return record; // ya tiene el formato correcto (eventId, buyerName, etc.)
+    return { ...record, eventId };
   }
   if(store === 'ticketTypes'){
     return {
       id: record.id,
-      eventId: SUPABASE_EVENT_ID,
+      eventId,
       name: record.name,
       price: record.price,
       isActive: record.isActive,
@@ -878,13 +1074,14 @@ function buildRemotePayload(store, record){
     };
   }
   if(store === 'eventConfig'){
-    // El "id" local (siempre 1) es solo una clave interna de IndexedDB.
-    // En Supabase, el evento real vive bajo SUPABASE_EVENT_ID — usamos
-    // siempre ese id al sincronizar, nunca el id local.
+    const remoteEventId = eventId || record.eventId || activeEventId;
+    if(!remoteEventId) throw new Error('No hay eventId remoto para sincronizar eventConfig.');
     return {
-      id: SUPABASE_EVENT_ID,
+      id: remoteEventId,
       name: record.eventName,
-      currencySymbol: record.currencySymbol
+      currencySymbol: record.currencySymbol,
+      createdAt: record.createdAt ? new Date(record.createdAt).toISOString() : undefined,
+      createdBy: currentDeviceId
     };
   }
   return record;
@@ -895,36 +1092,41 @@ async function enqueueSyncChange(action, store, record, autoProcess = true){
     console.error('Record sin ID, no se puede sincronizar:', record);
     return;
   }
+  const eventId = store === 'eventConfig' ? currentQueueEventId(record) : currentQueueEventId(record);
+  if(store !== 'eventConfig' && !eventId){
+    console.warn('⚠️ Cambio pendiente sin eventId remoto; se resolverá cuando el evento se sincronice:', store, record.id);
+  }
   
   const syncItem = {
     id: `${action}_${store}_${record.id}_${Date.now()}`,
     action,        // 'INSERT', 'UPDATE', 'DELETE'
     store,         // 'purchases', 'ticketTypes', 'eventConfig'
     recordId: record.id,
-    record,
+    eventId,
+    localEventId: activeLocalEventId,
+    record:{ ...record, eventId: record.eventId || eventId },
     timestamp: Date.now(),
     synced: false,
     retries: 0
   };
   
   await putRecord('syncQueue', syncItem);
-  console.log('📌 Cambio encolado:', action, store, record.id);
+  console.log('📌 Cambio encolado:', action, store, record.id, 'eventId:', eventId || 'pendiente');
   
-  // Intentar enviar inmediatamente si hay conexión
-  // (autoProcess=false se usa para encolados masivos, donde es mejor
-  // procesar la cola completa UNA vez al final, no en cada elemento)
   if(autoProcess && navigator.onLine){
-    await processSyncQueue();
+    await processSyncQueue(eventId || activeEventId);
   }
 }
 
 // Procesar la cola de cambios pendientes
-async function processSyncQueue(){
+async function processSyncQueue(onlyEventId = null){
   if(!supabase || !navigator.onLine) return;
+  await resolvePendingLocalEvent();
   
   console.log('🔄 Procesando syncQueue...');
   
-  const pending = await getAll('syncQueue');
+  let pending = await getAll('syncQueue');
+  if(onlyEventId) pending = pending.filter(item => item.eventId && String(item.eventId) === String(onlyEventId));
   if(!pending.length){
     console.log('✅ syncQueue vacía');
     return;
@@ -933,9 +1135,13 @@ async function processSyncQueue(){
   for(const item of pending){
     try{
       const table = REMOTE_TABLE_MAP[item.store] || item.store;
+      const itemEventId = item.eventId || (item.localEventId === activeLocalEventId ? currentQueueEventId(item.record) : null);
+      if(item.store !== 'eventConfig' && !itemEventId){
+        throw new Error(`Operación ${item.id} sin eventId remoto; queda pendiente.`);
+      }
       
       if(item.action === 'INSERT' || item.action === 'UPDATE'){
-        const payload = buildRemotePayload(item.store, item.record);
+        const payload = buildRemotePayload(item.store, item.record, itemEventId);
         // Enviar a Supabase (upsert = insert o update automáticamente)
         const { error } = await supabase
           .from(table)
@@ -959,25 +1165,24 @@ async function processSyncQueue(){
       item.retries = (item.retries || 0) + 1;
       
       if(item.retries > 5){
-        console.error('❌ Sync fallido después de 5 intentos:', item, err);
-        showToast(`Error sincronizando ${item.recordId}`, 'error');
-      } else {
-        await putRecord('syncQueue', item);
+        console.error('❌ Sync fallido después de 5 intentos; se conserva en syncQueue para reintento manual/automático:', item, err);
+        showToast(`Error sincronizando ${item.recordId}; se reintentará`, 'error');
       }
+      await putRecord('syncQueue', item);
     }
   }
 }
 
 // Escuchar cambios en tiempo real desde Supabase
 function setupRealtimeListener(){
-  if(!supabase || realtimeSubscription) return;
+  if(!supabase || realtimeSubscription || !activeEventId) return;
   
   console.log('📡 Configurando Realtime listener...');
   
   try{
     realtimeSubscription = supabase
-      .channel('purchases-changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'purchases' }, async payload => {
+      .channel(`event-${activeEventId}-changes`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'purchases', filter:`eventId=eq.${activeEventId}` }, async payload => {
         const { eventType, new: newRecord, old: oldRecord } = payload;
         
         // Ignorar cambios que vinieron de este dispositivo
@@ -1004,6 +1209,12 @@ function setupRealtimeListener(){
         if(currentSection === 'fiesta') await renderFiestaList();
         
         console.log('✅ UI actualizada con cambios remotos');
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'ticketTypes', filter:`eventId=eq.${activeEventId}` }, async payload => {
+        const { eventType, new: newRecord, old: oldRecord } = payload;
+        if(eventType === 'DELETE') await deleteRecord('ticketTypes', oldRecord.id);
+        else await putRecord('ticketTypes', { ...newRecord, category:newRecord.name });
+        if(currentSection === 'ajustes') await renderAjustes();
       })
       .subscribe((status) => {
         console.log('Realtime subscription status:', status);
@@ -1211,12 +1422,14 @@ function openTicketTypeForm(existing){
     if(!price || price < 1){ await appAlert('El precio debe ser un valor positivo.'); return; }
     const record = isEdit ? { ...existing } : { 
       id: `ticket_${Date.now()}_${Math.random().toString(36).substr(2,9)}`,
+      eventId: currentQueueEventId(),
       isActive:true, 
       createdAt: Date.now() 
     };
     record.name = category;
     record.category = category;
     record.price = price;
+    record.eventId = currentQueueEventId();
     await putRecord('ticketTypes', record);
     // ========== SINCRONIZAR CON SUPABASE ==========
     await enqueueSyncChange(isEdit ? 'UPDATE' : 'INSERT', 'ticketTypes', record);
@@ -1599,7 +1812,7 @@ async function openPurchaseForm(existing, directSale=false){
       ? { ...existing }
       : {
           id: `purchase_${now}_${Math.random().toString(36).substr(2,9)}`,
-          eventId: SUPABASE_EVENT_ID,  // NUEVO: vincular al evento
+          eventId: currentQueueEventId(),  // vincular al evento activo
           status: directSale ? 'complete' : 'pending',
           enteredCount: directSale ? totalQuantity : 0,
           enteredAt: directSale ? now : null,
@@ -1616,7 +1829,7 @@ async function openPurchaseForm(existing, directSale=false){
     record.items = items;
     record.totalQuantity = totalQuantity;
     record.totalAmount = totalAmount;
-    record.eventId = SUPABASE_EVENT_ID;  // NUEVO: asegurar que eventId está siempre presente
+    record.eventId = currentQueueEventId();  // asegurar que eventId está siempre presente
 
     if(UNIQUE_CI){
       const purchases = await getAll('purchases');
@@ -2010,6 +2223,11 @@ const BackupService = {
       dbName: DB_NAME,
       dbVersion: DB_VERSION,
       exportedAt: new Date().toISOString(),
+      localEventId: activeLocalEventId,
+      remoteEventId: eventCfg?.eventId || activeEventId || null,
+      eventConfig: eventCfg || null,
+      ticketTypes: data.ticketTypes,
+      purchases: data.purchases,
       eventName: eventCfg?.eventName || '',
       data
     };
@@ -2042,6 +2260,7 @@ const BackupService = {
       }
     });
     await loadEventConfig();
+    if(payload.remoteEventId || eventCfg?.eventId) setActiveEventId(payload.remoteEventId || eventCfg.eventId);
   },
   // Compara dos payloads para detectar compatibilidad
   comparePayloads(current, incoming){
@@ -2479,19 +2698,24 @@ function initWizard(){
 
     eventCfg = {
       id: 1,
+      eventId: null,
       eventName: name,
       currencySymbol: currency,
       setupCompleted: true,
+      remoteSyncPending: true,
       createdAt: Date.now()
     };
     await putRecord('eventConfig', eventCfg);
-    // ========== SINCRONIZAR EVENTO CON SUPABASE ==========
-    await enqueueSyncChange('UPDATE', 'eventConfig', eventCfg);
-    // ========== FIN SINCRONIZACIÓN ==========
+    if(supabase && navigator.onLine){
+      await createRemoteEventForConfig(eventCfg);
+    } else {
+      setActiveEventId(null);
+    }
 
     for(const t of wizardTicketDraft){
       const ticketRecord = {
         id: `ticket_${Date.now()}_${Math.random().toString(36).substr(2,9)}`,
+        eventId: currentQueueEventId(),
         name: t.category.trim(),
         category: t.category.trim(),
         price: roundMoney(t.price),
