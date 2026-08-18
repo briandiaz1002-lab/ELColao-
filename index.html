@@ -1142,12 +1142,58 @@ async function processSyncQueue(onlyEventId = null){
       
       if(item.action === 'INSERT' || item.action === 'UPDATE'){
         const payload = buildRemotePayload(item.store, item.record, itemEventId);
-        // Enviar a Supabase (upsert = insert o update automáticamente)
-        const { error } = await supabase
-          .from(table)
-          .upsert(payload, { onConflict: 'id' });
-        
-        if(error) throw error;
+
+        // ========== LÓGICA ESPECIAL PARA ticketTypes ==========
+        // Problema: el constraint UNIQUE(eventId, name) impide upsert por id
+        // cuando ya existe un ticket con mismo nombre pero distinto id remoto.
+        // Solución: buscar primero por (eventId, name). Si existe en remoto,
+        // usar el id remoto para actualizar ese registro (y sincronizar el id
+        // local con el remoto). Si no existe, insertar normalmente por id.
+        if(item.store === 'ticketTypes' && itemEventId){
+          const { data: existing, error: lookupErr } = await supabase
+            .from('ticketTypes')
+            .select('id')
+            .eq('eventId', itemEventId)
+            .eq('name', payload.name)
+            .maybeSingle();
+          
+          if(lookupErr) throw lookupErr;
+          
+          if(existing && existing.id && existing.id !== payload.id){
+            // Existe con distinto id: actualizamos el registro remoto usando su id real
+            // y sincronizamos el id local para que coincida en el futuro
+            console.log(`🔄 ticketType "${payload.name}" ya existe remotamente con id ${existing.id}; actualizando ese registro`);
+            const mergedPayload = { ...payload, id: existing.id };
+            const { error: updateErr } = await supabase
+              .from('ticketTypes')
+              .update(mergedPayload)
+              .eq('id', existing.id);
+            if(updateErr) throw updateErr;
+            
+            // Actualizar IndexedDB local para que el id local coincida con el remoto
+            const localRecord = await getById('ticketTypes', item.recordId);
+            if(localRecord && localRecord.id !== existing.id){
+              await deleteRecord('ticketTypes', localRecord.id);
+              await putRecord('ticketTypes', { ...localRecord, id: existing.id });
+              console.log(`✅ id local de ticketType "${payload.name}" actualizado a ${existing.id}`);
+            }
+          } else {
+            // No existe o ya tiene el mismo id: upsert normal por id
+            const { error } = await supabase
+              .from(table)
+              .upsert(payload, { onConflict: 'id' });
+            if(error) throw error;
+          }
+        // ========== FIN LÓGICA ESPECIAL ticketTypes ==========
+
+        } else {
+          // Todas las demás tablas (purchases, eventConfig): upsert normal por id
+          const { error } = await supabase
+            .from(table)
+            .upsert(payload, { onConflict: 'id' });
+          if(error) throw error;
+        }
+
       } else if(item.action === 'DELETE'){
         const { error } = await supabase
           .from(table)
@@ -2401,6 +2447,15 @@ async function renderBackup(){
       </p>
       <button id="btnPushExisting" class="btn w-full" style="background:var(--success); color:#0B0E1A;">📤 Subir todo lo existente a Supabase</button>
     </div>
+
+    <div class="ticket-stub p-5 border-l-4 mt-5" style="border-color:var(--accent-dim);">
+      <h2 class="font-display text-lg mb-2 text-[var(--accent)]">🧹 LIMPIAR COLA DE SINCRONIZACIÓN</h2>
+      <p class="text-sm text-[var(--text-dim)] mb-4">
+        Si ves errores repetidos de sincronización en la consola (por ejemplo tickets que no suben por conflicto de nombre),
+        usa esto para limpiar los elementos atascados de la cola. No borra datos locales ni remotos.
+      </p>
+      <button id="btnClearStuckQueue" class="btn btn-accent w-full">🧹 Limpiar cola atascada</button>
+    </div>
   `;
 
   document.getElementById('btnPushExisting').addEventListener('click', async ()=>{
@@ -2420,6 +2475,25 @@ async function renderBackup(){
       'success',
       '☁️ Migración encolada'
     );
+  });
+
+  document.getElementById('btnClearStuckQueue').addEventListener('click', async ()=>{
+    const all = await getAll('syncQueue');
+    const stuck = all.filter(item => (item.retries || 0) >= 5);
+    if(!stuck.length){
+      await appAlert('No hay elementos atascados en la cola.', 'success', 'Cola limpia');
+      return;
+    }
+    const ok = await appConfirm(
+      `Hay ${stuck.length} elemento(s) atascado(s) que fallaron 5+ veces. Se eliminarán de la cola (no se borran datos locales ni remotos). ¿Continuar?`,
+      'warning', 'Limpiar cola', 'Sí, limpiar', 'Cancelar'
+    );
+    if(!ok) return;
+    for(const item of stuck){
+      await deleteRecord('syncQueue', item.id);
+    }
+    showToast(`${stuck.length} elemento(s) eliminado(s) de la cola`, 'success', '🧹 Cola limpiada');
+    await renderBackup();
   });
 
   document.getElementById('btnBackupJson').addEventListener('click', async ()=>{
