@@ -825,6 +825,30 @@ async function switchEvent(eventIdOrLocalId, localId=null){
  */
 
 // Inicializar Supabase (con fallback si no está disponible)
+// Purga automática de items atascados en syncQueue para ticketTypes.
+// Se ejecuta al iniciar, antes de processSyncQueue.
+// Elimina de la cola los items de ticketTypes con retries >= 5 o que
+// ya fallaron con 409 (conflicto de nombre único en Supabase).
+// Esto es seguro porque pullRemoteData() ya descarga los datos correctos
+// desde la nube; los items atascados en cola son redundantes.
+async function purgeStuckTicketQueueItems(){
+  try{
+    const all = await getAll('syncQueue');
+    const stuckTickets = all.filter(item =>
+      item.store === 'ticketTypes' && (item.retries || 0) >= 5
+    );
+    if(!stuckTickets.length) return;
+    console.log(`🧹 Purgando ${stuckTickets.length} item(s) de ticketTypes atascados en syncQueue...`);
+    for(const item of stuckTickets){
+      await deleteRecord('syncQueue', item.id);
+      console.log(`🗑️ Eliminado de cola: ${item.id}`);
+    }
+    console.log('✅ Cola de ticketTypes limpiada automáticamente');
+  }catch(err){
+    console.warn('⚠️ No se pudo limpiar cola atascada:', err);
+  }
+}
+
 async function initSupabase(){
   if(supabase) return; // Ya inicializado
   
@@ -856,6 +880,16 @@ async function initSupabase(){
     if(navigator.onLine){
       await resolvePendingEventSnapshots();
       await resolvePendingLocalEvent();
+
+      // ========== LIMPIEZA AUTOMÁTICA DE ITEMS ATASCADOS ==========
+      // Antes de procesar la cola, purgamos cualquier item de ticketTypes
+      // con retries >= 5. Estos items fallaron permanentemente (normalmente
+      // por un conflicto de nombre con el registro ya existente en Supabase).
+      // pullRemoteData() ya descarga los datos correctos desde la nube,
+      // así que estos items en cola son redundantes y solo generan ruido.
+      await purgeStuckTicketQueueItems();
+      // ========== FIN LIMPIEZA ==========
+
       await processSyncQueue();
       if(activeEventId) await pullRemoteData();
     }
@@ -1133,9 +1167,29 @@ async function processSyncQueue(onlyEventId = null){
   }
   
   for(const item of pending){
+    // ========== SKIP ITEMS PERMANENTEMENTE ATASCADOS ==========
+    // Si un item ya falló 5+ veces, no lo seguimos intentando en
+    // cada ciclo (evita el loop infinito de errores en consola).
+    // El usuario puede limpiarlos desde Backup → "Limpiar cola atascada".
+    if((item.retries || 0) >= 5){
+      console.warn(`⏭️ Saltando item atascado (${item.retries} intentos): ${item.id}`);
+      continue;
+    }
+    // ========== FIN SKIP ==========
+
     try{
       const table = REMOTE_TABLE_MAP[item.store] || item.store;
-      const itemEventId = item.eventId || (item.localEventId === activeLocalEventId ? currentQueueEventId(item.record) : null);
+
+      // Calcular eventId con múltiples fallbacks:
+      // 1. item.eventId (si el item lo tiene almacenado explícitamente)
+      // 2. currentQueueEventId(item.record) si es el evento activo local
+      // 3. item.record.eventId (campo dentro del record — lo más confiable)
+      // 4. SUPABASE_EVENT_ID como último recurso
+      const itemEventId = item.eventId
+        || (item.localEventId === activeLocalEventId ? currentQueueEventId(item.record) : null)
+        || item.record?.eventId
+        || (item.store === 'ticketTypes' || item.store === 'purchases' ? activeEventId : null);
+
       if(item.store !== 'eventConfig' && !itemEventId){
         throw new Error(`Operación ${item.id} sin eventId remoto; queda pendiente.`);
       }
@@ -1149,36 +1203,47 @@ async function processSyncQueue(onlyEventId = null){
         // Solución: buscar primero por (eventId, name). Si existe en remoto,
         // usar el id remoto para actualizar ese registro (y sincronizar el id
         // local con el remoto). Si no existe, insertar normalmente por id.
-        if(item.store === 'ticketTypes' && itemEventId){
-          const { data: existing, error: lookupErr } = await supabase
-            .from('ticketTypes')
-            .select('id')
-            .eq('eventId', itemEventId)
-            .eq('name', payload.name)
-            .maybeSingle();
-          
-          if(lookupErr) throw lookupErr;
-          
-          if(existing && existing.id && existing.id !== payload.id){
-            // Existe con distinto id: actualizamos el registro remoto usando su id real
-            // y sincronizamos el id local para que coincida en el futuro
-            console.log(`🔄 ticketType "${payload.name}" ya existe remotamente con id ${existing.id}; actualizando ese registro`);
-            const mergedPayload = { ...payload, id: existing.id };
-            const { error: updateErr } = await supabase
+        if(item.store === 'ticketTypes'){
+          // Usar el eventId más confiable disponible
+          const lookupEventId = itemEventId || payload.eventId;
+
+          if(lookupEventId && payload.name){
+            const { data: existing, error: lookupErr } = await supabase
               .from('ticketTypes')
-              .update(mergedPayload)
-              .eq('id', existing.id);
-            if(updateErr) throw updateErr;
+              .select('id')
+              .eq('eventId', lookupEventId)
+              .eq('name', payload.name)
+              .maybeSingle();
             
-            // Actualizar IndexedDB local para que el id local coincida con el remoto
-            const localRecord = await getById('ticketTypes', item.recordId);
-            if(localRecord && localRecord.id !== existing.id){
-              await deleteRecord('ticketTypes', localRecord.id);
-              await putRecord('ticketTypes', { ...localRecord, id: existing.id });
-              console.log(`✅ id local de ticketType "${payload.name}" actualizado a ${existing.id}`);
+            if(lookupErr) throw lookupErr;
+            
+            if(existing && existing.id && existing.id !== payload.id){
+              // Existe con distinto id: actualizar registro remoto con su id real
+              // y sincronizar el id local para que coincida en el futuro
+              console.log(`🔄 ticketType "${payload.name}" ya existe remotamente con id ${existing.id}; actualizando ese registro`);
+              const mergedPayload = { ...payload, id: existing.id };
+              const { error: updateErr } = await supabase
+                .from('ticketTypes')
+                .update(mergedPayload)
+                .eq('id', existing.id);
+              if(updateErr) throw updateErr;
+              
+              // Actualizar IndexedDB local para que el id coincida con el remoto
+              const localRecord = await getById('ticketTypes', item.recordId);
+              if(localRecord && localRecord.id !== existing.id){
+                await deleteRecord('ticketTypes', localRecord.id);
+                await putRecord('ticketTypes', { ...localRecord, id: existing.id });
+                console.log(`✅ id local de ticketType "${payload.name}" actualizado a ${existing.id}`);
+              }
+            } else {
+              // No existe o ya tiene el mismo id: upsert normal por id
+              const { error } = await supabase
+                .from(table)
+                .upsert(payload, { onConflict: 'id' });
+              if(error) throw error;
             }
           } else {
-            // No existe o ya tiene el mismo id: upsert normal por id
+            // Sin nombre o eventId para hacer el lookup: upsert normal
             const { error } = await supabase
               .from(table)
               .upsert(payload, { onConflict: 'id' });
@@ -1209,10 +1274,10 @@ async function processSyncQueue(onlyEventId = null){
       
     }catch(err){
       item.retries = (item.retries || 0) + 1;
-      
-      if(item.retries > 5){
-        console.error('❌ Sync fallido después de 5 intentos; se conserva en syncQueue para reintento manual/automático:', item, err);
-        showToast(`Error sincronizando ${item.recordId}; se reintentará`, 'error');
+      if(item.retries >= 5){
+        console.error(`❌ Sync fallido (${item.retries} intentos, se pausa hasta limpieza manual):`, item.id, err);
+      } else {
+        console.warn(`⚠️ Sync fallido (intento ${item.retries}/5):`, item.id, err?.message || err);
       }
       await putRecord('syncQueue', item);
     }
