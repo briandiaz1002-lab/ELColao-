@@ -12,27 +12,24 @@
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<!-- ========== SUPABASE SDK ==========
-     Se carga como módulo ESM y se guarda en window.__supabaseCreateClient
-     (NO se usa el nombre global "supabase" para evitar conflictos con
-     extensiones del navegador o protecciones de privacidad como
-     "Tracking Prevention" de Edge, que pueden inyectar su propia
-     variable global con ese mismo nombre).
-     Si falla (sin internet, CDN caído, bloqueado): la app sigue
-     funcionando 100% offline. -->
-<script type="module">
-  (async () => {
-    try {
-      const mod = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm');
-      window.__supabaseCreateClient = mod.createClient;
-    } catch(e) {
-      console.warn('⚠️ No se pudo cargar el SDK de Supabase:', e);
-    } finally {
-      window.__supabaseSdkChecked = true;
-    }
-  })();
+<!-- SUPABASE TEMPORALMENTE DESHABILITADO. Código conservado para reactivar después. -->
+<script type="text/plain" data-supabase-disabled>
+// Código original del SDK de Supabase conservado y deshabilitado temporalmente.
+// Se carga como módulo ESM y se guarda en window.__supabaseCreateClient.
+// Si falla (sin internet, CDN caído, bloqueado): la app sigue funcionando offline.
+
+(async () => {
+  try {
+    const mod = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm');
+    window.__supabaseCreateClient = mod.createClient;
+  } catch(e) {
+    console.warn('⚠️ No se pudo cargar el SDK de Supabase:', e);
+  } finally {
+    window.__supabaseSdkChecked = true;
+  }
+})();
 </script>
-<!-- ========== FIN SUPABASE SDK ========== -->
+<!-- FIN SUPABASE TEMPORALMENTE DESHABILITADO -->
 <style>
   :root{
     --bg: #0B0E1A;
@@ -802,7 +799,8 @@ async function openEvent(remoteEventId, localId=null){
 
 async function switchEvent(eventIdOrLocalId, localId=null){
   await saveActiveEventSnapshot();
-  if(supabase && navigator.onLine) await processSyncQueue(currentQueueEventId());
+  // SUPABASE DESHABILITADO: no procesar syncQueue al cambiar de evento.
+  // if(supabase && navigator.onLine) await processSyncQueue(currentQueueEventId());
   cleanupRealtimeListener();
   const maybeRemoteId = Number(eventIdOrLocalId);
   if(Number.isFinite(maybeRemoteId) && maybeRemoteId > 0){
@@ -825,30 +823,6 @@ async function switchEvent(eventIdOrLocalId, localId=null){
  */
 
 // Inicializar Supabase (con fallback si no está disponible)
-// Purga automática de items atascados en syncQueue para ticketTypes.
-// Se ejecuta al iniciar, antes de processSyncQueue.
-// Elimina de la cola los items de ticketTypes con retries >= 5 o que
-// ya fallaron con 409 (conflicto de nombre único en Supabase).
-// Esto es seguro porque pullRemoteData() ya descarga los datos correctos
-// desde la nube; los items atascados en cola son redundantes.
-async function purgeStuckTicketQueueItems(){
-  try{
-    const all = await getAll('syncQueue');
-    const stuckTickets = all.filter(item =>
-      item.store === 'ticketTypes' && (item.retries || 0) >= 5
-    );
-    if(!stuckTickets.length) return;
-    console.log(`🧹 Purgando ${stuckTickets.length} item(s) de ticketTypes atascados en syncQueue...`);
-    for(const item of stuckTickets){
-      await deleteRecord('syncQueue', item.id);
-      console.log(`🗑️ Eliminado de cola: ${item.id}`);
-    }
-    console.log('✅ Cola de ticketTypes limpiada automáticamente');
-  }catch(err){
-    console.warn('⚠️ No se pudo limpiar cola atascada:', err);
-  }
-}
-
 async function initSupabase(){
   if(supabase) return; // Ya inicializado
   
@@ -880,16 +854,6 @@ async function initSupabase(){
     if(navigator.onLine){
       await resolvePendingEventSnapshots();
       await resolvePendingLocalEvent();
-
-      // ========== LIMPIEZA AUTOMÁTICA DE ITEMS ATASCADOS ==========
-      // Antes de procesar la cola, purgamos cualquier item de ticketTypes
-      // con retries >= 5. Estos items fallaron permanentemente (normalmente
-      // por un conflicto de nombre con el registro ya existente en Supabase).
-      // pullRemoteData() ya descarga los datos correctos desde la nube,
-      // así que estos items en cola son redundantes y solo generan ruido.
-      await purgeStuckTicketQueueItems();
-      // ========== FIN LIMPIEZA ==========
-
       await processSyncQueue();
       if(activeEventId) await pullRemoteData();
     }
@@ -1147,9 +1111,10 @@ async function enqueueSyncChange(action, store, record, autoProcess = true){
   await putRecord('syncQueue', syncItem);
   console.log('📌 Cambio encolado:', action, store, record.id, 'eventId:', eventId || 'pendiente');
   
-  if(autoProcess && navigator.onLine){
-    await processSyncQueue(eventId || activeEventId);
-  }
+  // SUPABASE TEMPORALMENTE DESHABILITADO: conservar la cola local, pero no enviarla.
+  // if(autoProcess && navigator.onLine){
+  //   await processSyncQueue(eventId || activeEventId);
+  // }
 }
 
 // Procesar la cola de cambios pendientes
@@ -1167,98 +1132,21 @@ async function processSyncQueue(onlyEventId = null){
   }
   
   for(const item of pending){
-    // ========== SKIP ITEMS PERMANENTEMENTE ATASCADOS ==========
-    // Si un item ya falló 5+ veces, no lo seguimos intentando en
-    // cada ciclo (evita el loop infinito de errores en consola).
-    // El usuario puede limpiarlos desde Backup → "Limpiar cola atascada".
-    if((item.retries || 0) >= 5){
-      console.warn(`⏭️ Saltando item atascado (${item.retries} intentos): ${item.id}`);
-      continue;
-    }
-    // ========== FIN SKIP ==========
-
     try{
       const table = REMOTE_TABLE_MAP[item.store] || item.store;
-
-      // Calcular eventId con múltiples fallbacks:
-      // 1. item.eventId (si el item lo tiene almacenado explícitamente)
-      // 2. currentQueueEventId(item.record) si es el evento activo local
-      // 3. item.record.eventId (campo dentro del record — lo más confiable)
-      // 4. SUPABASE_EVENT_ID como último recurso
-      const itemEventId = item.eventId
-        || (item.localEventId === activeLocalEventId ? currentQueueEventId(item.record) : null)
-        || item.record?.eventId
-        || (item.store === 'ticketTypes' || item.store === 'purchases' ? activeEventId : null);
-
+      const itemEventId = item.eventId || (item.localEventId === activeLocalEventId ? currentQueueEventId(item.record) : null);
       if(item.store !== 'eventConfig' && !itemEventId){
         throw new Error(`Operación ${item.id} sin eventId remoto; queda pendiente.`);
       }
       
       if(item.action === 'INSERT' || item.action === 'UPDATE'){
         const payload = buildRemotePayload(item.store, item.record, itemEventId);
-
-        // ========== LÓGICA ESPECIAL PARA ticketTypes ==========
-        // Problema: el constraint UNIQUE(eventId, name) impide upsert por id
-        // cuando ya existe un ticket con mismo nombre pero distinto id remoto.
-        // Solución: buscar primero por (eventId, name). Si existe en remoto,
-        // usar el id remoto para actualizar ese registro (y sincronizar el id
-        // local con el remoto). Si no existe, insertar normalmente por id.
-        if(item.store === 'ticketTypes'){
-          // Usar el eventId más confiable disponible
-          const lookupEventId = itemEventId || payload.eventId;
-
-          if(lookupEventId && payload.name){
-            const { data: existing, error: lookupErr } = await supabase
-              .from('ticketTypes')
-              .select('id')
-              .eq('eventId', lookupEventId)
-              .eq('name', payload.name)
-              .maybeSingle();
-            
-            if(lookupErr) throw lookupErr;
-            
-            if(existing && existing.id && existing.id !== payload.id){
-              // Existe con distinto id: actualizar registro remoto con su id real
-              // y sincronizar el id local para que coincida en el futuro
-              console.log(`🔄 ticketType "${payload.name}" ya existe remotamente con id ${existing.id}; actualizando ese registro`);
-              const mergedPayload = { ...payload, id: existing.id };
-              const { error: updateErr } = await supabase
-                .from('ticketTypes')
-                .update(mergedPayload)
-                .eq('id', existing.id);
-              if(updateErr) throw updateErr;
-              
-              // Actualizar IndexedDB local para que el id coincida con el remoto
-              const localRecord = await getById('ticketTypes', item.recordId);
-              if(localRecord && localRecord.id !== existing.id){
-                await deleteRecord('ticketTypes', localRecord.id);
-                await putRecord('ticketTypes', { ...localRecord, id: existing.id });
-                console.log(`✅ id local de ticketType "${payload.name}" actualizado a ${existing.id}`);
-              }
-            } else {
-              // No existe o ya tiene el mismo id: upsert normal por id
-              const { error } = await supabase
-                .from(table)
-                .upsert(payload, { onConflict: 'id' });
-              if(error) throw error;
-            }
-          } else {
-            // Sin nombre o eventId para hacer el lookup: upsert normal
-            const { error } = await supabase
-              .from(table)
-              .upsert(payload, { onConflict: 'id' });
-            if(error) throw error;
-          }
-        // ========== FIN LÓGICA ESPECIAL ticketTypes ==========
-
-        } else {
-          // Todas las demás tablas (purchases, eventConfig): upsert normal por id
-          const { error } = await supabase
-            .from(table)
-            .upsert(payload, { onConflict: 'id' });
-          if(error) throw error;
-        }
-
+        // Enviar a Supabase (upsert = insert o update automáticamente)
+        const { error } = await supabase
+          .from(table)
+          .upsert(payload, { onConflict: 'id' });
+        
+        if(error) throw error;
       } else if(item.action === 'DELETE'){
         const { error } = await supabase
           .from(table)
@@ -1274,10 +1162,10 @@ async function processSyncQueue(onlyEventId = null){
       
     }catch(err){
       item.retries = (item.retries || 0) + 1;
-      if(item.retries >= 5){
-        console.error(`❌ Sync fallido (${item.retries} intentos, se pausa hasta limpieza manual):`, item.id, err);
-      } else {
-        console.warn(`⚠️ Sync fallido (intento ${item.retries}/5):`, item.id, err?.message || err);
+      
+      if(item.retries > 5){
+        console.error('❌ Sync fallido después de 5 intentos; se conserva en syncQueue para reintento manual/automático:', item, err);
+        showToast(`Error sincronizando ${item.recordId}; se reintentará`, 'error');
       }
       await putRecord('syncQueue', item);
     }
@@ -2510,19 +2398,13 @@ async function renderBackup(){
         Sube todo lo que ya existe localmente a la nube, para que otros dispositivos también
         puedan verlo. Es seguro repetirlo: no duplica nada.
       </p>
-      <button id="btnPushExisting" class="btn w-full" style="background:var(--success); color:#0B0E1A;">📤 Subir todo lo existente a Supabase</button>
-    </div>
-
-    <div class="ticket-stub p-5 border-l-4 mt-5" style="border-color:var(--accent-dim);">
-      <h2 class="font-display text-lg mb-2 text-[var(--accent)]">🧹 LIMPIAR COLA DE SINCRONIZACIÓN</h2>
-      <p class="text-sm text-[var(--text-dim)] mb-4">
-        Si ves errores repetidos de sincronización en la consola (por ejemplo tickets que no suben por conflicto de nombre),
-        usa esto para limpiar los elementos atascados de la cola. No borra datos locales ni remotos.
-      </p>
-      <button id="btnClearStuckQueue" class="btn btn-accent w-full">🧹 Limpiar cola atascada</button>
+      <!-- SUPABASE TEMPORALMENTE DESHABILITADO: botón conservado para reactivar después.
+<button id="btnPushExisting" class="btn w-full" style="background:var(--success); color:#0B0E1A;">📤 Subir todo lo existente a Supabase</button>
+-->
     </div>
   `;
 
+  /* SUPABASE TEMPORALMENTE DESHABILITADO: listener conservado para reactivar después.
   document.getElementById('btnPushExisting').addEventListener('click', async ()=>{
     if(!supabase){
       await appAlert('No hay conexión con Supabase en este momento. Conéctate a internet e inténtalo de nuevo.', 'warning', 'Sin conexión');
@@ -2533,7 +2415,6 @@ async function renderBackup(){
       'warning', 'Subir datos existentes', 'Sí, subir todo', 'Cancelar'
     );
     if(!ok) return;
-    
     const result = await pushAllLocalDataToSupabase();
     showToast(
       `Evento: ${result.eventConfig ? '✓' : '—'} · Tickets: ${result.ticketTypes} · Compras: ${result.purchases}`,
@@ -2541,25 +2422,7 @@ async function renderBackup(){
       '☁️ Migración encolada'
     );
   });
-
-  document.getElementById('btnClearStuckQueue').addEventListener('click', async ()=>{
-    const all = await getAll('syncQueue');
-    const stuck = all.filter(item => (item.retries || 0) >= 5);
-    if(!stuck.length){
-      await appAlert('No hay elementos atascados en la cola.', 'success', 'Cola limpia');
-      return;
-    }
-    const ok = await appConfirm(
-      `Hay ${stuck.length} elemento(s) atascado(s) que fallaron 5+ veces. Se eliminarán de la cola (no se borran datos locales ni remotos). ¿Continuar?`,
-      'warning', 'Limpiar cola', 'Sí, limpiar', 'Cancelar'
-    );
-    if(!ok) return;
-    for(const item of stuck){
-      await deleteRecord('syncQueue', item.id);
-    }
-    showToast(`${stuck.length} elemento(s) eliminado(s) de la cola`, 'success', '🧹 Cola limpiada');
-    await renderBackup();
-  });
+  */
 
   document.getElementById('btnBackupJson').addEventListener('click', async ()=>{
     const filename = await BackupService.download('backup');
@@ -2903,7 +2766,8 @@ async function init(){
   });
 
   // ========== INICIALIZAR SUPABASE Y DESCARGAR DATOS EXISTENTES ==========
-  await initSupabase();
+  // SUPABASE TEMPORALMENTE DESHABILITADO (modo 100% IndexedDB/offline):
+  // await initSupabase();
   // Si initSupabase() descargó configuración/tickets de otro dispositivo,
   // hay que releer eventCfg local para reflejar ese cambio antes de decidir
   // si mostrar el asistente de bienvenida.
