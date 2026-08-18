@@ -4,6 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>El Colao — Control de Entradas</title>
+<meta name="theme-color" content="#0B0E1A">
+<meta name="description" content="Control de entradas El Colao con soporte offline.">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.svg">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -129,6 +133,38 @@
 </head>
 <body class="min-h-screen">
 
+<!-- ========== INICIO: PANTALLA INICIAL / SELECTOR DE EVENTOS ========== -->
+<div id="homeOverlay" class="hidden min-h-screen flex items-center justify-center p-4">
+  <div class="w-full max-w-4xl">
+    <div class="text-center mb-8">
+      <div class="font-display text-6xl text-[var(--accent)] tracking-widest">EL COLAO</div>
+      <p class="text-[var(--text-dim)] mt-2">PWA offline para controlar compras, entradas y asistencia de tus eventos.</p>
+    </div>
+    <div class="grid md:grid-cols-3 gap-5 mb-5">
+      <button id="homeNewEvent" class="ticket-stub p-6 text-left hover:brightness-110 transition">
+        <div class="text-4xl mb-3">✨</div>
+        <h2 class="font-display text-2xl text-[var(--accent)]">NUEVO EVENTO</h2>
+        <p class="text-sm text-[var(--text-dim)]">Crea un evento desde cero sin borrar los anteriores guardados.</p>
+      </button>
+      <div class="ticket-stub p-6 md:col-span-2">
+        <div class="flex items-center justify-between gap-3 mb-3">
+          <h2 class="font-display text-2xl text-[var(--accent)]">EVENTOS</h2>
+          <span id="homeOfflineBadge" class="badge" style="background:var(--surface-2); color:var(--text-dim);">Offline listo</span>
+        </div>
+        <div id="homeEventsList" class="space-y-2 max-h-72 overflow-y-auto scrollbar-thin pr-1"></div>
+      </div>
+    </div>
+    <div class="ticket-stub p-5 border-l-4" style="border-color:var(--violet);">
+      <h2 class="font-display text-xl mb-2 text-[var(--violet)]">⬆️ SUBIR BASE DE DATOS</h2>
+      <p class="text-sm text-[var(--text-dim)] mb-4">Si ya tienes un backup JSON, súbelo aquí para abrirlo directamente y actualizar la base local sin crear un evento de cero.</p>
+      <input type="file" id="homeRestoreFile" accept="application/json,.json" class="mb-3">
+      <button id="homeRestoreBtn" class="btn btn-accent w-full">Restaurar y abrir evento</button>
+    </div>
+  </div>
+</div>
+<!-- ========== FIN: PANTALLA INICIAL / SELECTOR DE EVENTOS ========== -->
+
+
 <!-- ========== INICIO: SHELL APP ========== -->
 <div id="app" class="hidden min-h-screen">
   <div class="flex">
@@ -139,7 +175,7 @@
         <div class="text-xs text-[var(--text-dim)] mt-1">Control de entradas</div>
       </div>
       <nav class="flex-1 py-3" id="sidebarNav"></nav>
-      <div class="p-4 text-[10px] text-[var(--text-dim)] border-t" style="border-color:var(--line);">v1.0 · Sprint S4</div>
+      <div class="p-4 border-t space-y-2" style="border-color:var(--line);"><button id="desktopBackHome" class="btn btn-ghost w-full text-xs">← Eventos</button><div class="text-[10px] text-[var(--text-dim)]">v1.0 · PWA</div></div>
     </aside>
 
     <!-- Mobile topbar -->
@@ -156,7 +192,7 @@
           <div class="font-display text-xl text-[var(--accent)]">MENÚ</div>
           <button id="mobileMenuClose" class="text-[var(--text-dim)] text-2xl leading-none">&times;</button>
         </div>
-        <nav class="flex-1" id="sidebarNavMobile"></nav>
+        <nav class="flex-1" id="sidebarNavMobile"></nav><button id="mobileBackHome" class="btn btn-ghost w-full text-xs mt-3">← Eventos</button>
       </div>
     </div>
 
@@ -244,13 +280,15 @@
 <script>
 // ========== INICIO: CONFIGURACIÓN Y CONSTANTES ==========
 const DB_NAME = 'ElColaoDB';
-const DB_VERSION = 3; // v3: ticketTypes ahora usa IDs de texto (no autoIncrement) para sincronizar con Supabase
+const DB_VERSION = 4; // v4: PWA + selector offline de eventos
 let db = null;
 let eventCfg = null; // cache del registro eventConfig
 let currentSection = 'compras';
 const ITEMS_PER_PAGE = 20;
 let purchasesCurrentPage = 1;
 let comprasTotalPages = 1;
+let activeLocalEventId = localStorage.getItem('elcolao.activeLocalEventId') || null;
+let snapshotTimer = null;
 
 // ========== SUPABASE CONFIGURACIÓN ==========
 const SUPABASE_URL = 'https://iizljgpzutiisheesafy.supabase.co';
@@ -367,7 +405,7 @@ function putRecord(storeName, record){
   return new Promise((resolve, reject)=>{
     const t = tx(storeName, 'readwrite');
     const req = t.objectStore(storeName).put(record);
-    req.onsuccess = ()=> resolve(req.result);
+    req.onsuccess = ()=> { scheduleEventSnapshot(); resolve(req.result); };
     req.onerror = ()=> reject(req.error);
   });
 }
@@ -376,7 +414,7 @@ function deleteRecord(storeName, id){
   return new Promise((resolve, reject)=>{
     const t = tx(storeName, 'readwrite');
     const req = t.objectStore(storeName).delete(id);
-    req.onsuccess = ()=> resolve(true);
+    req.onsuccess = ()=> { scheduleEventSnapshot(); resolve(true); };
     req.onerror = ()=> reject(req.error);
   });
 }
@@ -489,6 +527,96 @@ function hideFormModal(){
   document.getElementById('formModalBox').innerHTML = '';
 }
 // ========== FIN: UTILIDADES ==========
+
+
+// ========== INICIO: SELECTOR OFFLINE DE EVENTOS ==========
+const EventRegistry = {
+  key: 'elcolao.events',
+  list(){ return JSON.parse(localStorage.getItem(this.key) || '[]'); },
+  save(list){ localStorage.setItem(this.key, JSON.stringify(list)); },
+  upsert(meta){
+    const list = this.list().filter(e=> e.id !== meta.id);
+    list.unshift({ ...meta, updatedAt: Date.now() });
+    this.save(list);
+  },
+  remove(id){ this.save(this.list().filter(e=> e.id !== id)); localStorage.removeItem(`elcolao.snapshot.${id}`); }
+};
+
+async function collectLocalEventPayload(kind='autosave'){
+  const data = {};
+  for(const store of BackupService.stores){ data[store] = await getAll(store); }
+  return { app:'ElColao', kind, version:BackupService.version, dbName:DB_NAME, dbVersion:DB_VERSION, exportedAt:new Date().toISOString(), eventName:eventCfg?.eventName||'', data };
+}
+
+async function saveActiveEventSnapshot(){
+  if(!activeLocalEventId || !eventCfg?.setupCompleted) return;
+  const payload = await collectLocalEventPayload('event-snapshot');
+  localStorage.setItem(`elcolao.snapshot.${activeLocalEventId}`, JSON.stringify(payload));
+  EventRegistry.upsert({ id:activeLocalEventId, name:eventCfg.eventName, currencySymbol:eventCfg.currencySymbol, purchases:payload.data.purchases.length, tickets:payload.data.ticketTypes.length });
+}
+
+function scheduleEventSnapshot(){
+  if(snapshotTimer) clearTimeout(snapshotTimer);
+  snapshotTimer = setTimeout(()=> saveActiveEventSnapshot().catch(console.warn), 250);
+}
+
+async function clearWorkingDatabase(){
+  for(const storeName of BackupService.stores){
+    const records = await getAll(storeName);
+    for(const record of records) await deleteRecord(storeName, record.id);
+  }
+  eventCfg = null;
+}
+
+async function openHome(){
+  await saveActiveEventSnapshot();
+  cleanupRealtimeListener();
+  document.getElementById('app').classList.add('hidden');
+  document.getElementById('wizardOverlay').classList.add('hidden');
+  document.getElementById('homeOverlay').classList.remove('hidden');
+  renderHomeEvents();
+}
+
+function renderHomeEvents(){
+  const wrap = document.getElementById('homeEventsList');
+  const events = EventRegistry.list();
+  if(!events.length){
+    wrap.innerHTML = '<div class="text-sm text-[var(--text-dim)] py-8 text-center">Todavía no hay eventos guardados en este dispositivo.</div>';
+    return;
+  }
+  wrap.innerHTML = events.map(e=>`
+    <div class="flex items-center justify-between gap-3 px-4 py-3 rounded-lg" style="background:var(--surface-2); border:1px solid var(--line);">
+      <div class="min-w-0"><div class="font-semibold truncate">${escHtml(e.name)}</div><div class="text-xs text-[var(--text-dim)]">${e.purchases||0} compras · ${e.tickets||0} tipos · ${formatDateTime(e.updatedAt)}</div></div>
+      <div class="flex gap-2"><button class="btn btn-accent text-xs" data-open-event="${e.id}">Abrir</button><button class="btn btn-ghost text-xs" data-delete-event="${e.id}">🗑️</button></div>
+    </div>`).join('');
+  wrap.querySelectorAll('[data-open-event]').forEach(btn=> btn.addEventListener('click', ()=> loadEventSnapshot(btn.dataset.openEvent)));
+  wrap.querySelectorAll('[data-delete-event]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    if(await appConfirm('¿Eliminar este evento guardado de este dispositivo?', 'error', 'Eliminar evento', 'Eliminar', 'Cancelar', 'danger')){ EventRegistry.remove(btn.dataset.deleteEvent); renderHomeEvents(); }
+  }));
+}
+
+async function loadEventSnapshot(id){
+  const raw = localStorage.getItem(`elcolao.snapshot.${id}`);
+  if(!raw){ await appAlert('No se encontró la base local de ese evento.', 'error'); return; }
+  await BackupService.restore(JSON.parse(raw));
+  activeLocalEventId = id;
+  localStorage.setItem('elcolao.activeLocalEventId', id);
+  document.getElementById('homeOverlay').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  renderSidebar();
+  navigateTo('compras');
+}
+
+async function startNewEvent(){
+  await saveActiveEventSnapshot();
+  await clearWorkingDatabase();
+  activeLocalEventId = `local_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+  localStorage.setItem('elcolao.activeLocalEventId', activeLocalEventId);
+  document.getElementById('homeOverlay').classList.add('hidden');
+  document.getElementById('wizardOverlay').classList.remove('hidden');
+  initWizard();
+}
+// ========== FIN: SELECTOR OFFLINE DE EVENTOS ==========
 
 // ========== INICIO: SINCRONIZACIÓN SUPABASE ==========
 /**
@@ -2380,6 +2508,7 @@ function initWizard(){
     document.getElementById('app').classList.remove('hidden');
     renderSidebar();
     navigateTo('compras');
+    await saveActiveEventSnapshot();
     showToast('Evento configurado correctamente', 'success', '¡Listo!');
   });
 }
@@ -2392,6 +2521,23 @@ async function init(){
 
   document.getElementById('mobileMenuBtn').addEventListener('click', openMobileNav);
   document.getElementById('mobileMenuClose').addEventListener('click', closeMobileNav);
+  document.getElementById('desktopBackHome').addEventListener('click', openHome);
+  document.getElementById('mobileBackHome').addEventListener('click', openHome);
+  document.getElementById('homeNewEvent').addEventListener('click', startNewEvent);
+  document.getElementById('homeRestoreBtn').addEventListener('click', async ()=>{
+    const file = document.getElementById('homeRestoreFile').files[0];
+    if(!file){ await appAlert('Selecciona un archivo JSON primero.'); return; }
+    const payload = await readJsonFile(file);
+    await BackupService.restore(payload);
+    activeLocalEventId = `local_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    localStorage.setItem('elcolao.activeLocalEventId', activeLocalEventId);
+    await saveActiveEventSnapshot();
+    document.getElementById('homeOverlay').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+    renderSidebar();
+    navigateTo('compras');
+    showToast('Base de datos restaurada y guardada como evento', 'success');
+  });
 
   // ========== INICIALIZAR SUPABASE Y DESCARGAR DATOS EXISTENTES ==========
   await initSupabase();
@@ -2401,17 +2547,18 @@ async function init(){
   await loadEventConfig();
   // ========== FIN INICIALIZACIÓN SUPABASE ==========
 
-  if(!eventCfg.setupCompleted){
-    document.getElementById('wizardOverlay').classList.remove('hidden');
-    initWizard();
-  } else {
-    document.getElementById('app').classList.remove('hidden');
-    renderSidebar();
-    navigateTo('compras');
+  if(eventCfg.setupCompleted && !activeLocalEventId){
+    activeLocalEventId = `local_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    localStorage.setItem('elcolao.activeLocalEventId', activeLocalEventId);
+    await saveActiveEventSnapshot();
   }
+  await openHome();
 }
 
 window.addEventListener('DOMContentLoaded', init);
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=> navigator.serviceWorker.register('./sw.js').catch(err=> console.warn('SW no registrado:', err)));
+}
 // ========== FIN: INICIALIZACIÓN ==========
 </script>
 </body>
